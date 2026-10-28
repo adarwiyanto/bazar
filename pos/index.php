@@ -1,0 +1,1316 @@
+<?php
+require_once __DIR__ . '/../core/db.php';
+require_once __DIR__ . '/../core/functions.php';
+require_once __DIR__ . '/../core/security.php';
+require_once __DIR__ . '/../core/auth.php';
+require_once __DIR__ . '/../core/csrf.php';
+require_once __DIR__ . '/../core/rbac.php';
+require_once __DIR__ . '/../core/inventory.php';
+require_once __DIR__ . '/../core/pos_shift.php';
+require_once __DIR__ . '/../lib/upload_secure.php';
+
+if (!function_exists('pos_safe_branch_id')) {
+  function pos_safe_branch_id(): int {
+    if (function_exists('active_branch_id')) {
+      $id = (int)active_branch_id();
+      if ($id > 0) return $id;
+    }
+    return 1;
+  }
+}
+
+if (!function_exists('pos_normalize_customer_phone')) {
+  function pos_normalize_customer_phone(string $phone): string {
+    $digits = preg_replace('/\D+/', '', $phone) ?? '';
+    if ($digits === '') return '';
+    if (str_starts_with($digits, '0')) $digits = '62' . substr($digits, 1);
+    elseif (!str_starts_with($digits, '62')) $digits = '62' . $digits;
+    return $digits;
+  }
+}
+
+start_secure_session();
+require_login();
+ensure_landing_order_tables();
+ensure_loyalty_rewards_table();
+ensure_sales_transaction_code_column();
+ensure_sales_user_column();
+ensure_pos_print_jobs_table();
+ensure_inventory_module_schema();
+ensure_pos_shift_schema();
+ensure_payment_methods_table();
+ensure_qris_banks_table();
+ensure_sales_payment_bank_column();
+ensure_sales_guide_column();
+ensure_sales_discount_columns();
+
+$appName = app_config()['app']['name'];
+$storeName = setting('store_name', $appName);
+$storeSubtitle = setting('store_subtitle', '');
+$isAndroidApp = is_android_app_request();
+$me = current_user();
+ensure_rbac_schema();
+$me = require_menu_access('pos', 'view');
+$isOwner = ((string)(resolve_user_role($me)['role_key'] ?? '') === 'owner');
+$resolvedRoleKey = (string)(resolve_user_role($me)['role_key'] ?? '');
+$adminLandingUrl = resolve_default_landing_page_for_user($me);
+$isShiftAdmin = has_menu_access($me, 'shift', 'create');
+$branchId = pos_safe_branch_id();
+$activeShift = null;
+try {
+  $activeShift = pos_shift_get_active($branchId);
+} catch (Throwable $e) {
+  $activeShift = null;
+}
+if ($activeShift) {
+  pos_shift_mark_user_activity($activeShift, (int)($me['id'] ?? 0), 'join');
+}
+$posDefaultOpeningCash = (float)setting('pos_default_opening_cash', '100000');
+$activePaymentMethods = get_active_payment_methods();
+$qrisBanks = get_active_qris_banks();
+$activeGuides = get_active_guides();
+$stmtProducts = db()->prepare("SELECT p.id, p.name, CASE WHEN bpp.is_active = 1 THEN bpp.price ELSE p.price END AS price, p.image_path, p.product_type, p.track_stock, p.allow_bom, p.category AS category_id, COALESCE(st.current_stock,0) AS current_stock FROM products p LEFT JOIN branch_product_prices bpp ON bpp.product_id=p.id AND bpp.branch_id=? LEFT JOIN (SELECT product_id, SUM(qty_in-qty_out) AS current_stock FROM stock_ledger WHERE branch_id=? GROUP BY product_id) st ON st.product_id=p.id WHERE p.show_on_pos = 1 ORDER BY p.name ASC");
+$stmtProducts->execute([$branchId, $branchId]);
+$products = $stmtProducts->fetchAll();
+$hasProducts = !empty($products);
+$productsById = [];
+foreach ($products as $p) {
+  $productsById[(int)$p['id']] = $p;
+}
+
+$cart = $_SESSION['pos_cart'] ?? [];
+$rewardCart = $_SESSION['pos_reward_cart'] ?? [];
+$bypassItems = $_SESSION['pos_bypass_items'] ?? [];
+$itemDiscounts = $_SESSION['pos_item_discounts'] ?? [];
+$activeOrderId = $_SESSION['pos_order_id'] ?? null;
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+  csrf_check();
+  $action = $_POST['action'] ?? '';
+
+  $actionPermissionMap = [
+    'add' => 'create',
+    'inc' => 'edit',
+    'dec' => 'edit',
+    'remove' => 'delete',
+    'update_qty' => 'edit',
+    'set_item_discount' => 'edit',
+    'toggle_bypass' => 'approve',
+    'load_order' => 'create',
+    'save_order' => 'create',
+    'clear_order' => 'delete',
+    'claim_reward' => 'create',
+    'remove_reward' => 'delete',
+    'checkout' => 'create',
+    'new_transaction' => 'create',
+    'print' => 'print',
+  ];
+  if (isset($actionPermissionMap[$action])) {
+    require_action_access('pos', $actionPermissionMap[$action]);
+  }
+  $productId = (int)($_POST['product_id'] ?? 0);
+  $rewardId = (int)($_POST['reward_id'] ?? 0);
+
+  try {
+    if (in_array($action, ['add','inc','dec','remove','update_qty','toggle_bypass'], true)) {
+      if ($productId <= 0 || empty($productsById[$productId])) {
+        throw new Exception('Produk tidak ditemukan.');
+      }
+    }
+    if (in_array($action, ['claim_reward','remove_reward'], true)) {
+      if ($rewardId <= 0) {
+        throw new Exception('Reward tidak ditemukan.');
+      }
+      if (empty($activeOrderId)) {
+        throw new Exception('Reward hanya tersedia untuk pesanan aktif.');
+      }
+    }
+
+    if ($action === 'set_item_discount') {
+      $pid = (int)($_POST['product_id'] ?? 0);
+      $discAmt  = max(0.0, (float)($_POST['discount_amount'] ?? 0));
+      $discType = in_array($_POST['discount_type'] ?? '', ['fixed', 'percent'], true)
+        ? $_POST['discount_type'] : 'fixed';
+      if ($discType === 'percent') $discAmt = min(100.0, $discAmt);
+      if ($discAmt > 0) {
+        $itemDiscounts[$pid] = ['amount' => $discAmt, 'type' => $discType];
+      } else {
+        unset($itemDiscounts[$pid]);
+      }
+      $_SESSION['pos_item_discounts'] = $itemDiscounts;
+    } elseif ($action === 'new_transaction') {
+      $cart = [];
+      $rewardCart = [];
+      $bypassItems = [];
+      $itemDiscounts = [];
+      $_SESSION['pos_item_discounts'] = [];
+      unset($_SESSION['pos_receipt']);
+      if (!empty($_SESSION['pos_order_id'])) {
+        $orderId = (int)$_SESSION['pos_order_id'];
+        $stmt = db()->prepare("UPDATE orders SET status='pending' WHERE id=?");
+        $stmt->execute([$orderId]);
+        unset($_SESSION['pos_order_id']);
+      }
+      $_SESSION['pos_notice'] = 'Transaksi baru siap dibuat.';
+    } elseif ($action === 'add') {
+      $cart[$productId] = ($cart[$productId] ?? 0) + 1;
+      $_SESSION['pos_notice'] = 'Produk ditambahkan ke keranjang.';
+    } elseif ($action === 'inc') {
+      $cart[$productId] = ($cart[$productId] ?? 1) + 1;
+      $_SESSION['pos_notice'] = 'Jumlah produk ditambah.';
+    } elseif ($action === 'dec') {
+      $current = (int)($cart[$productId] ?? 1);
+      if ($current <= 1) {
+        unset($cart[$productId]);
+        unset($bypassItems[$productId]);
+      } else {
+        $cart[$productId] = $current - 1;
+      }
+      $_SESSION['pos_notice'] = 'Jumlah produk dikurangi.';
+    } elseif ($action === 'update_qty') {
+      if (!isset($cart[$productId])) {
+        throw new Exception('Produk tidak ditemukan di keranjang.');
+      }
+      $newQty = (int)($_POST['qty'] ?? 0);
+      if ($newQty <= 0) {
+        unset($cart[$productId], $bypassItems[$productId]);
+        $_SESSION['pos_notice'] = 'Produk dihapus dari keranjang.';
+      } else {
+        $cart[$productId] = min($newQty, 9999);
+        $_SESSION['pos_notice'] = 'Jumlah produk diperbarui.';
+      }
+    } elseif ($action === 'remove') {
+      unset($cart[$productId]);
+      unset($bypassItems[$productId]);
+      $_SESSION['pos_notice'] = 'Produk dihapus dari keranjang.';
+    } elseif ($action === 'toggle_bypass') {
+      if (!$isOwner) {
+        throw new Exception('Hanya owner yang dapat bypass BOM/stok.');
+      }
+      if ($productId <= 0 || empty($productsById[$productId]) || !isset($cart[$productId])) {
+        throw new Exception('Produk tidak ditemukan di keranjang.');
+      }
+      if (!empty($bypassItems[$productId])) {
+        unset($bypassItems[$productId]);
+        $_SESSION['pos_notice'] = 'Bypass BOM/Stok dinonaktifkan.';
+      } else {
+        $bypassItems[$productId] = 1;
+        $_SESSION['pos_notice'] = 'Bypass BOM/Stok diaktifkan.';
+      }
+    } elseif ($action === 'load_order') {
+      $orderId = (int)($_POST['order_id'] ?? 0);
+      if ($orderId <= 0) {
+        throw new Exception('Pesanan tidak ditemukan.');
+      }
+      if (!empty($cart)) {
+        throw new Exception('Kosongkan keranjang terlebih dahulu.');
+      }
+      $db = db();
+      $stmt = $db->prepare("
+        SELECT o.id, o.order_code, o.status, c.name, COALESCE(c.phone, c.email) AS contact
+        FROM orders o
+        JOIN customers c ON c.id = o.customer_id
+        WHERE o.id = ? AND o.status = 'pending'
+        LIMIT 1
+      ");
+      $stmt->execute([$orderId]);
+      $order = $stmt->fetch();
+      if (!$order) {
+        throw new Exception('Pesanan tidak tersedia.');
+      }
+      $stmt = $db->prepare("
+        SELECT oi.product_id, oi.qty
+        FROM order_items oi
+        WHERE oi.order_id = ?
+      ");
+      $stmt->execute([$orderId]);
+      $items = $stmt->fetchAll();
+      if (empty($items)) {
+        throw new Exception('Item pesanan kosong.');
+      }
+      foreach ($items as $item) {
+        $pid = (int)$item['product_id'];
+        $qty = (int)$item['qty'];
+        if ($pid > 0 && $qty > 0) {
+          $cart[$pid] = $qty;
+        }
+      }
+      foreach (array_keys($bypassItems) as $bypassPid) {
+        if (empty($cart[(int)$bypassPid])) unset($bypassItems[(int)$bypassPid]);
+      }
+      $stmt = $db->prepare("UPDATE orders SET status='processing' WHERE id=?");
+      $stmt->execute([$orderId]);
+      $_SESSION['pos_order_id'] = $orderId;
+      $rewardCart = [];
+      $_SESSION['pos_notice'] = 'Pesanan ' . $order['order_code'] . ' dimuat ke keranjang.';
+    } elseif ($action === 'claim_reward') {
+      $db = db();
+      $stmt = $db->prepare("
+        SELECT o.id, c.id AS customer_id, c.loyalty_points
+        FROM orders o
+        JOIN customers c ON c.id = o.customer_id
+        WHERE o.id = ?
+        LIMIT 1
+      ");
+      $stmt->execute([(int)$activeOrderId]);
+      $order = $stmt->fetch();
+      if (!$order) {
+        throw new Exception('Pesanan tidak ditemukan.');
+      }
+      $stmt = $db->prepare("
+        SELECT lr.id, lr.product_id, lr.points_required, p.name
+        FROM loyalty_rewards lr
+        JOIN products p ON p.id = lr.product_id
+        WHERE lr.id = ?
+        LIMIT 1
+      ");
+      $stmt->execute([$rewardId]);
+      $reward = $stmt->fetch();
+      if (!$reward) {
+        throw new Exception('Reward tidak tersedia.');
+      }
+      $currentPoints = (int)($order['loyalty_points'] ?? 0);
+      $pointsRequired = (int)$reward['points_required'];
+      if ($currentPoints < $pointsRequired) {
+        throw new Exception('Poin tidak mencukupi untuk klaim reward.');
+      }
+      $stmt = $db->prepare("UPDATE customers SET loyalty_points = loyalty_points - ? WHERE id = ?");
+      $stmt->execute([$pointsRequired, (int)$order['customer_id']]);
+      $rewardCart[$rewardId] = ($rewardCart[$rewardId] ?? 0) + 1;
+      $_SESSION['pos_notice'] = 'Reward ditambahkan ke keranjang sebagai gratis.';
+    } elseif ($action === 'remove_reward') {
+      if (empty($rewardCart[$rewardId])) {
+        throw new Exception('Reward tidak ada di keranjang.');
+      }
+      $db = db();
+      $stmt = $db->prepare("
+        SELECT o.id, c.id AS customer_id
+        FROM orders o
+        JOIN customers c ON c.id = o.customer_id
+        WHERE o.id = ?
+        LIMIT 1
+      ");
+      $stmt->execute([(int)$activeOrderId]);
+      $order = $stmt->fetch();
+      if (!$order) {
+        throw new Exception('Pesanan tidak ditemukan.');
+      }
+      $stmt = $db->prepare("SELECT points_required FROM loyalty_rewards WHERE id = ? LIMIT 1");
+      $stmt->execute([$rewardId]);
+      $reward = $stmt->fetch();
+      if (!$reward) {
+        throw new Exception('Reward tidak tersedia.');
+      }
+      $qty = (int)$rewardCart[$rewardId];
+      unset($rewardCart[$rewardId]);
+      $refundPoints = (int)$reward['points_required'] * $qty;
+      $stmt = $db->prepare("UPDATE customers SET loyalty_points = loyalty_points + ? WHERE id = ?");
+      $stmt->execute([$refundPoints, (int)$order['customer_id']]);
+      $_SESSION['pos_notice'] = 'Reward dihapus dari keranjang dan poin dikembalikan.';
+    } elseif ($action === 'checkout') {
+      if (empty($cart) && empty($rewardCart)) throw new Exception('Keranjang masih kosong.');
+      $activeShift = pos_shift_get_active($branchId);
+      if (!$activeShift) {
+        throw new Exception('Belum ada shift aktif. Silakan buka shift terlebih dahulu.');
+      }
+
+      $paymentMethod = $_POST['payment_method'] ?? '';
+      $validPaymentCodes = array_column(get_active_payment_methods(), 'code');
+      if (!in_array($paymentMethod, $validPaymentCodes, true)) {
+        throw new Exception('Pilih metode pembayaran.');
+      }
+      $paymentBank = null;
+      if (payment_method_requires_bank($paymentMethod)) {
+        $paymentBank = trim((string)($_POST['payment_bank'] ?? ''));
+        $validQrisBanks = array_column(get_active_qris_banks(), 'name');
+        if ($paymentBank === '' || !in_array($paymentBank, $validQrisBanks, true)) {
+          throw new Exception('Pilih bank non-tunai yang aktif.');
+        }
+      }
+      $paymentProofPath = null;
+      $guideName = trim((string)($_POST['guide_name'] ?? ''));
+      if ($guideName === '') $guideName = null;
+      $txDiscountAmt  = max(0.0, (float)($_POST['tx_discount_amount'] ?? 0));
+      $txDiscountType = in_array($_POST['tx_discount_type'] ?? '', ['fixed', 'percent'], true)
+        ? $_POST['tx_discount_type'] : 'fixed';
+      if ($txDiscountType === 'percent') $txDiscountAmt = min(100.0, $txDiscountAmt);
+      $expectedTxDiscountValue = 0.0;
+      if ($txDiscountAmt > 0) {
+        $expectedTxDiscountValue = $txDiscountType === 'percent'
+          ? round($total * $txDiscountAmt / 100, 2)
+          : min($txDiscountAmt, $total);
+      }
+      $expectedFinalTotal = max(0.0, $total - $expectedTxDiscountValue);
+      $cashReceived = null;
+      $cashChange = null;
+      $isCashPayment = in_array(strtolower((string)$paymentMethod), ['cash', 'tunai'], true) || str_contains(strtolower((string)$paymentMethod), 'cash') || str_contains(strtolower((string)$paymentMethod), 'tunai');
+      if ($isCashPayment) {
+        $cashReceived = (float)($_POST['cash_received'] ?? 0);
+        if ($cashReceived < $expectedFinalTotal) {
+          throw new Exception('Uang diterima kurang dari total belanja.');
+        }
+        $cashChange = $cashReceived - $expectedFinalTotal;
+      }
+      $customerName = trim((string)($_POST['customer_name'] ?? ''));
+      $customerPhone = pos_normalize_customer_phone((string)($_POST['customer_phone'] ?? ''));
+      $customerGender = trim((string)($_POST['customer_gender'] ?? ''));
+      if (!in_array($customerGender, ['', 'male', 'female'], true)) $customerGender = '';
+      $customerId = null;
+      if ($customerPhone !== '') {
+        if ($customerName === '') throw new Exception('Nama pelanggan wajib diisi untuk nomor HP baru.');
+        $lookup = db()->prepare("SELECT id, name, gender FROM customers WHERE phone=? LIMIT 1");
+        $lookup->execute([$customerPhone]);
+        $existingCustomer = $lookup->fetch();
+        if ($existingCustomer) {
+          $customerId = (int)$existingCustomer['id'];
+          $customerName = (string)$existingCustomer['name'];
+          $customerGender = (string)($existingCustomer['gender'] ?? $customerGender);
+        } else {
+          $createCustomer = db()->prepare("INSERT INTO customers (name, phone, gender) VALUES (?,?,?)");
+          $createCustomer->execute([$customerName, $customerPhone, $customerGender !== '' ? $customerGender : null]);
+          $customerId = (int)db()->lastInsertId();
+        }
+      }
+      $db = db();
+      $db->beginTransaction();
+      $branchId = pos_safe_branch_id();
+      $transactionCode = 'TRX-' . date('YmdHis') . '-' . strtoupper(bin2hex(random_bytes(2)));
+      $transactionGroupUuid = trim((string)($_POST['transaction_group_uuid'] ?? ''));
+      if ($transactionGroupUuid === '') {
+        $transactionGroupUuid = 'GRP-' . date('YmdHis') . '-' . strtoupper(bin2hex(random_bytes(4)));
+      }
+      $offlineUuid = trim((string)($_POST['offline_uuid'] ?? ''));
+      $stmt = $db->prepare("INSERT INTO sales (transaction_code, transaction_group_uuid, offline_uuid, sync_status, base_sale_code, revision_suffix, revision_no, is_active_revision, revision_status, original_sale_id, product_id, qty, price_each, total, payment_method, payment_proof_path, payment_bank, guide_name, discount_amount, discount_type, tx_discount_amount, tx_discount_type, customer_id, customer_name, customer_phone, created_by, shift_id) VALUES (?,?,?, ?, ?,NULL,0,1,'active',NULL,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+      $receiptItems = [];
+      $receiptTotal = 0.0;
+      $autoProductionIds = [];
+
+      foreach ($cart as $pid => $qty) {
+        if (empty($productsById[$pid])) continue;
+        $product = $productsById[$pid];
+        $qty = (float)$qty;
+        if ($qty <= 0) continue;
+        $isBypass = $isOwner && !empty($bypassItems[(int)$pid]);
+        if ($isBypass) {
+          continue;
+        }
+        if ((string)($product['product_type'] ?? 'finished_good') !== 'finished_good' || (int)($product['track_stock'] ?? 1) !== 1) {
+          continue;
+        }
+
+        $stmtLock = $db->prepare("SELECT id FROM products WHERE id=? FOR UPDATE");
+        $stmtLock->execute([(int)$pid]);
+        $currentFgStock = branch_stock($branchId, (int)$pid);
+        if ($currentFgStock >= $qty) {
+          continue;
+        }
+        $shortage = $qty - $currentFgStock;
+        if (setting('pos_autoproduction_enabled', '1') !== '1') {
+          throw new Exception('Stok barang jadi tidak cukup dan auto-production POS nonaktif.');
+        }
+        $bom = get_active_bom_for_product((int)$pid, $branchId);
+        if (!$bom) {
+          throw new Exception('Stok barang jadi tidak cukup dan BOM aktif tidak ditemukan.');
+        }
+        $requirements = explode_bom_requirements((int)$bom['id'], $shortage);
+        foreach ($requirements as $req) {
+          $stmtLock->execute([(int)$req['material_product_id']]);
+          $materialStock = branch_stock($branchId, (int)$req['material_product_id']);
+          if ($materialStock < (float)$req['required_qty']) {
+            throw new Exception('Stok barang jadi kurang dan bahan baku auto-production tidak mencukupi.');
+          }
+        }
+        $productionId = create_production_with_items($db, [
+          'production_no' => 'APR-' . date('YmdHis') . '-' . strtoupper(bin2hex(random_bytes(2))),
+          'branch_id' => $branchId,
+          'bom_id' => (int)$bom['id'],
+          'finished_product_id' => (int)$pid,
+          'production_date' => date('Y-m-d'),
+          'qty_to_produce' => $shortage,
+          'status' => 'draft',
+          'mode_source' => 'pos_auto',
+          'notes' => 'Auto production from POS checkout',
+          'created_by' => (int)($me['id'] ?? 0),
+        ], $requirements);
+        post_production($productionId, (int)($me['id'] ?? 0), 'pos_sale_autoproduction_consume', 'pos_sale_autoproduction_output');
+        $autoProductionIds[] = $productionId;
+      }
+
+      foreach ($cart as $pid => $qty) {
+        if (empty($productsById[$pid])) {
+          throw new Exception('Produk tidak ditemukan saat checkout.');
+        }
+        $isBypass = $isOwner && !empty($bypassItems[(int)$pid]);
+        $qty = (int)$qty;
+        if ($qty <= 0) {
+          throw new Exception('Jumlah produk tidak valid.');
+        }
+        $price = (float)$productsById[$pid]['price'];
+        $itemDisc = $itemDiscounts[(int)$pid] ?? null;
+        $itemDiscAmt  = 0.0;
+        $itemDiscType = 'fixed';
+        if ($itemDisc) {
+          $itemDiscType = (string)($itemDisc['type'] ?? 'fixed');
+          $itemDiscAmt  = (float)($itemDisc['amount'] ?? 0);
+          if ($itemDiscType === 'percent') {
+            $itemDiscAmt = min(100.0, $itemDiscAmt);
+          }
+        }
+        $grossSubtotal = $price * $qty;
+        $itemDiscValue = $itemDiscType === 'percent'
+          ? round($grossSubtotal * $itemDiscAmt / 100, 2)
+          : min($itemDiscAmt, $grossSubtotal);
+        $total = max(0.0, $grossSubtotal - $itemDiscValue);
+        $saleOfflineUuid = $offlineUuid !== '' ? $offlineUuid : null;
+        $saleSyncStatus = $offlineUuid !== '' ? 'pending' : 'synced';
+        $stmt->execute([$transactionCode, $transactionGroupUuid, $saleOfflineUuid, $saleSyncStatus, $transactionCode, (int)$pid, $qty, $price, $total, $paymentMethod, $paymentProofPath, $paymentBank, $guideName, $itemDiscAmt, $itemDiscType, $txDiscountAmt, $txDiscountType, (int)($me['id'] ?? 0), (int)$activeShift['id']]);
+        $stmtUpdateBranch = $db->prepare("UPDATE sales SET branch_id=? WHERE id=?");
+        $saleId = (int)$db->lastInsertId();
+        $stmtUpdateBranch->execute([$branchId, $saleId]);
+        $db->prepare("UPDATE sales SET original_sale_id=? WHERE id=?")->execute([$saleId, $saleId]);
+
+        if ((string)($productsById[$pid]['product_type'] ?? 'finished_good') !== 'service' && (int)($productsById[$pid]['track_stock'] ?? 1) === 1) {
+          $stockNow = branch_stock($branchId, (int)$pid);
+          if (!$isBypass && $stockNow < $qty && setting('pos_autoproduction_allow_negative', '0') !== '1') {
+            throw new Exception('Stok tidak cukup untuk menyelesaikan penjualan POS.');
+          }
+          add_stock_ledger([
+            'branch_id' => $branchId,
+            'product_id' => (int)$pid,
+            'trans_type' => 'pos_sale',
+            'ref_table' => 'sales',
+            'ref_id' => $saleId,
+            'qty_in' => 0,
+            'qty_out' => $qty,
+            'unit_cost' => null,
+            'note' => 'Penjualan POS',
+            'created_by' => (int)($me['id'] ?? 0),
+          ]);
+        }
+        $receiptEntry = [
+          'name' => $productsById[$pid]['name'],
+          'qty' => $qty,
+          'price' => $price,
+          'subtotal' => $total,
+          'is_reward' => false,
+        ];
+        if ($itemDiscValue > 0) {
+          $receiptEntry['discount_amount'] = $itemDiscAmt;
+          $receiptEntry['discount_type']   = $itemDiscType;
+          $receiptEntry['discount_value']  = $itemDiscValue;
+        }
+        $receiptItems[] = $receiptEntry;
+        $receiptTotal += $total;
+      }
+      if (!empty($rewardCart)) {
+        $rewardIds = array_map('intval', array_keys($rewardCart));
+        $placeholders = implode(',', array_fill(0, count($rewardIds), '?'));
+        $stmtReward = $db->prepare("
+          SELECT lr.id, lr.product_id, p.name
+          FROM loyalty_rewards lr
+          JOIN products p ON p.id = lr.product_id
+          WHERE lr.id IN ($placeholders)
+        ");
+        $stmtReward->execute($rewardIds);
+        $rewardRows = [];
+        foreach ($stmtReward->fetchAll() as $reward) {
+          $rewardRows[(int)$reward['id']] = $reward;
+        }
+        foreach ($rewardCart as $rid => $qty) {
+          $reward = $rewardRows[(int)$rid] ?? null;
+          if (!$reward) {
+            throw new Exception('Reward tidak ditemukan saat checkout.');
+          }
+          $pid = (int)$reward['product_id'];
+          $qty = (int)$qty;
+          if ($qty <= 0) {
+            continue;
+          }
+          $stmt->execute([$transactionCode, $transactionGroupUuid, null, 'synced', $transactionCode, $pid, $qty, 0, 0, $paymentMethod, $paymentProofPath, $paymentBank, $guideName, 0, 'fixed', $txDiscountAmt, $txDiscountType, (int)($me['id'] ?? 0), (int)$activeShift['id']]);
+          $saleId = (int)$db->lastInsertId();
+          $stmtUpdateBranch = $db->prepare("UPDATE sales SET branch_id=? WHERE id=?");
+          $stmtUpdateBranch->execute([$branchId, $saleId]);
+          $db->prepare("UPDATE sales SET original_sale_id=? WHERE id=?")->execute([$saleId, $saleId]);
+          add_stock_ledger([
+            'branch_id' => $branchId,
+            'product_id' => $pid,
+            'trans_type' => 'pos_sale',
+            'ref_table' => 'sales',
+            'ref_id' => $saleId,
+            'qty_in' => 0,
+            'qty_out' => $qty,
+            'unit_cost' => null,
+            'note' => 'Penjualan POS reward',
+            'created_by' => (int)($me['id'] ?? 0),
+          ]);
+          $receiptItems[] = [
+            'name' => $reward['name'],
+            'qty' => $qty,
+            'price' => 0,
+            'subtotal' => 0,
+            'is_reward' => true,
+          ];
+        }
+      }
+      if (!empty($autoProductionIds)) {
+        $stmtLink = $db->prepare("INSERT INTO sales_production_links (transaction_code, production_id, branch_id) VALUES (?,?,?)");
+        foreach ($autoProductionIds as $productionId) {
+          $stmtLink->execute([$transactionCode, (int)$productionId, $branchId]);
+        }
+      }
+      $stmtFirst = $db->prepare("SELECT MIN(id) AS first_id FROM sales WHERE transaction_code=?");
+      $stmtFirst->execute([$transactionCode]);
+      $firstId = (int)($stmtFirst->fetch()['first_id'] ?? 0);
+      if ($firstId > 0) {
+        $db->prepare("UPDATE sales SET original_sale_id=? WHERE transaction_code=?")->execute([$firstId, $transactionCode]);
+      }
+      $db->commit();
+      if (!empty($_SESSION['pos_order_id'])) {
+        $orderId = (int)$_SESSION['pos_order_id'];
+        $stmt = $db->prepare("UPDATE orders SET status='completed', completed_at=NOW() WHERE id=?");
+        $stmt->execute([$orderId]);
+        $stmt = $db->prepare("
+          SELECT c.id, c.loyalty_remainder
+          FROM orders o
+          JOIN customers c ON c.id = o.customer_id
+          WHERE o.id = ?
+          LIMIT 1
+        ");
+        $stmt->execute([$orderId]);
+        $customer = $stmt->fetch();
+        if ($customer) {
+          $pointValue = (int)setting('loyalty_point_value', '0');
+          if ($pointValue > 0) {
+            $remainderMode = (string)setting('loyalty_remainder_mode', 'discard');
+            $carryRemainder = $remainderMode === 'carry';
+            $customerRemainder = (int)($customer['loyalty_remainder'] ?? 0);
+            $totalForPoints = (int)round($receiptTotal) + ($carryRemainder ? $customerRemainder : 0);
+            $pointsEarned = intdiv($totalForPoints, $pointValue);
+            $newRemainder = $carryRemainder ? ($totalForPoints % $pointValue) : 0;
+            $stmt = $db->prepare("
+              UPDATE customers
+              SET loyalty_points = loyalty_points + ?, loyalty_remainder = ?
+              WHERE id = ?
+            ");
+            $stmt->execute([$pointsEarned, $newRemainder, (int)$customer['id']]);
+          }
+        }
+        unset($_SESSION['pos_order_id']);
+      }
+      pos_shift_log((int)$activeShift['id'], (int)($me['id'] ?? 0), 'checkout');
+      $txDiscountValue = 0.0;
+      if ($txDiscountAmt > 0) {
+        $txDiscountValue = $txDiscountType === 'percent'
+          ? round($receiptTotal * $txDiscountAmt / 100, 2)
+          : min($txDiscountAmt, $receiptTotal);
+      }
+      $receiptFinalTotal = max(0.0, $receiptTotal - $txDiscountValue);
+      $receiptPaymentLabel = strtoupper($paymentMethod);
+      if ($paymentBank !== null) $receiptPaymentLabel .= ' - ' . $paymentBank;
+      $_SESSION['pos_receipt'] = [
+        'id' => $transactionCode,
+        'time' => date('d/m/Y H:i'),
+        'cashier' => $me['name'] ?? 'Kasir',
+        'guide' => $guideName,
+        'payment' => $receiptPaymentLabel,
+        'items' => $receiptItems,
+        'subtotal_before_tx_discount' => $receiptTotal,
+        'tx_discount_amount' => $txDiscountAmt,
+        'tx_discount_type' => $txDiscountType,
+        'tx_discount_value' => $txDiscountValue,
+        'total' => $receiptFinalTotal,
+        'paid_amount' => $cashReceived !== null ? $cashReceived : $receiptFinalTotal,
+        'cash_received' => $cashReceived,
+        'cash_change' => $cashChange,
+      ];
+
+      $printPayload = build_pos_receipt_payload($_SESSION['pos_receipt'], [
+        'store_name' => $storeName,
+        'store_subtitle' => $storeSubtitle,
+        'store_address' => setting('store_address', ''),
+        'store_phone' => setting('store_phone', ''),
+        'footer' => setting('receipt_footer', ''),
+        'store_logo' => setting('store_logo', ''),
+        'paid_amount' => $cashReceived !== null ? $cashReceived : $receiptFinalTotal,
+      ]);
+      $printJob = create_pos_print_job($printPayload, [
+        'sale_id' => isset($saleId) ? (int)$saleId : null,
+        'created_by' => (int)($me['id'] ?? 0),
+        'device_hint' => substr((string)($_SERVER['HTTP_USER_AGENT'] ?? ''), 0, 100),
+        'notes' => 'POS receipt bridge job',
+      ]);
+      if ($printJob && !empty($printJob['job_token'])) {
+        $_SESSION['pos_receipt']['print_job_token'] = (string)$printJob['job_token'];
+      }
+
+      $cart = [];
+      $rewardCart = [];
+      $bypassItems = [];
+      $itemDiscounts = [];
+      $_SESSION['pos_item_discounts'] = [];
+      $_SESSION['pos_notice'] = 'Transaksi berhasil disimpan.';
+    }
+  } catch (Throwable $e) {
+    if (isset($db) && $db->inTransaction()) {
+      $db->rollBack();
+    }
+    $_SESSION['pos_err'] = $e->getMessage();
+  }
+
+  foreach (array_keys($bypassItems) as $bypassPid) {
+    if (empty($cart[(int)$bypassPid])) unset($bypassItems[(int)$bypassPid]);
+  }
+  $_SESSION['pos_cart'] = $cart;
+  $_SESSION['pos_reward_cart'] = $rewardCart;
+  $_SESSION['pos_bypass_items'] = $bypassItems;
+  redirect(base_url('pos/index.php'));
+}
+
+$notice = $_SESSION['pos_notice'] ?? '';
+$err = $_SESSION['pos_err'] ?? '';
+$receipt = $_SESSION['pos_receipt'] ?? null;
+unset($_SESSION['pos_notice'], $_SESSION['pos_err']);
+
+$activeOrder = null;
+if (!empty($activeOrderId)) {
+  $stmt = db()->prepare("
+    SELECT o.order_code, c.name, COALESCE(c.phone, c.email) AS contact, c.loyalty_points
+    FROM orders o
+    JOIN customers c ON c.id = o.customer_id
+    WHERE o.id = ?
+    LIMIT 1
+  ");
+  $stmt->execute([(int)$activeOrderId]);
+  $activeOrder = $stmt->fetch();
+}
+
+$rewardOptions = db()->query("
+  SELECT lr.id, lr.product_id, lr.points_required, p.name
+  FROM loyalty_rewards lr
+  JOIN products p ON p.id = lr.product_id
+  ORDER BY lr.points_required ASC
+")->fetchAll();
+$rewardOptionsById = [];
+foreach ($rewardOptions as $reward) {
+  $rewardOptionsById[(int)$reward['id']] = $reward;
+}
+
+$availableRewards = [];
+if (!empty($activeOrder) && !empty($rewardOptions)) {
+  $points = (int)($activeOrder['loyalty_points'] ?? 0);
+  foreach ($rewardOptions as $reward) {
+    if ($points >= (int)$reward['points_required']) {
+      $availableRewards[] = $reward;
+    }
+  }
+}
+
+$pendingOrders = db()->query("
+  SELECT o.id, o.order_code, o.created_at, c.name, COALESCE(c.phone, c.email) AS contact
+  FROM orders o
+  JOIN customers c ON c.id = o.customer_id
+  WHERE o.status = 'pending'
+  ORDER BY o.created_at DESC
+  LIMIT 20
+")->fetchAll();
+
+$pendingOrderItems = [];
+if (!empty($pendingOrders)) {
+  $orderIds = array_map(fn($row) => (int)$row['id'], $pendingOrders);
+  $placeholders = implode(',', array_fill(0, count($orderIds), '?'));
+  $stmt = db()->prepare("
+    SELECT oi.order_id, oi.qty, p.name
+    FROM order_items oi
+    JOIN products p ON p.id = oi.product_id
+    WHERE oi.order_id IN ($placeholders)
+    ORDER BY oi.id ASC
+  ");
+  $stmt->execute($orderIds);
+  foreach ($stmt->fetchAll() as $item) {
+    $orderId = (int)$item['order_id'];
+    $pendingOrderItems[$orderId][] = [
+      'name' => $item['name'],
+      'qty' => (int)$item['qty'],
+    ];
+  }
+}
+
+$shiftSummary = null;
+if ($activeShift) {
+  try {
+    $shiftSummary = pos_shift_calculate_summary((int)$activeShift['id']);
+  } catch (Throwable $e) {
+    $shiftSummary = null;
+  }
+}
+
+$cartItems = [];
+$total = 0.0;
+$cartCount = 0;
+foreach ($cart as $pid => $qty) {
+  if (empty($productsById[$pid])) continue;
+  $price = (float)$productsById[$pid]['price'];
+  $qty = (int)$qty;
+  $grossSub = $price * $qty;
+  $iDisc = $itemDiscounts[(int)$pid] ?? null;
+  $iDiscAmt  = 0.0;
+  $iDiscType = 'fixed';
+  $iDiscValue = 0.0;
+  if ($iDisc) {
+    $iDiscType = (string)($iDisc['type'] ?? 'fixed');
+    $iDiscAmt  = (float)($iDisc['amount'] ?? 0);
+    if ($iDiscType === 'percent') $iDiscAmt = min(100.0, $iDiscAmt);
+    $iDiscValue = $iDiscType === 'percent'
+      ? round($grossSub * $iDiscAmt / 100, 2)
+      : min($iDiscAmt, $grossSub);
+  }
+  $subtotal = max(0.0, $grossSub - $iDiscValue);
+  $total += $subtotal;
+  $cartCount += $qty;
+  $cartItems[] = [
+    'id' => (int)$pid,
+    'name' => $productsById[$pid]['name'],
+    'price' => $price,
+    'qty' => $qty,
+    'subtotal' => $subtotal,
+    'is_reward' => false,
+    'is_bypass' => $isOwner && !empty($bypassItems[(int)$pid]),
+    'discount_amount' => $iDiscAmt,
+    'discount_type' => $iDiscType,
+    'discount_value' => $iDiscValue,
+  ];
+}
+if (!empty($rewardCart)) {
+  foreach ($rewardCart as $rid => $qty) {
+    $reward = $rewardOptionsById[(int)$rid] ?? null;
+    if (!$reward) continue;
+    $pid = (int)$reward['product_id'];
+    if (empty($productsById[$pid])) continue;
+    $qty = (int)$qty;
+    if ($qty <= 0) continue;
+    $cartCount += $qty;
+    $cartItems[] = [
+      'id' => $pid,
+      'reward_id' => (int)$rid,
+      'name' => $productsById[$pid]['name'],
+      'price' => 0,
+      'qty' => $qty,
+      'subtotal' => 0,
+      'is_reward' => true,
+      'points_required' => (int)$reward['points_required'],
+    ];
+  }
+}
+?>
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>POS</title>
+  <link rel="icon" href="<?php echo e(favicon_url()); ?>">
+  <link rel="apple-touch-icon" href="<?php echo e(favicon_url()); ?>">
+  <link rel="manifest" href="<?php echo e(base_url('manifest.php')); ?>">
+  <link rel="stylesheet" href="<?php echo e(asset_url('assets/app.css')); ?>">
+  <link rel="stylesheet" href="<?php echo e(asset_url('pos/pos.css')); ?>">
+</head>
+<body data-android-app="<?php echo $isAndroidApp ? '1' : '0'; ?>">
+  <div class="pos-page">
+    <div class="topbar pos-topbar">
+      <div class="title"><?php echo e($appName); ?> POS</div>
+      <div class="spacer"></div>
+      <div class="pos-user-menu">
+        <button class="pos-user-button" type="button" data-toggle-submenu="#pos-user-menu">
+          <div class="pos-user">
+            <div class="pos-user-name"><?php echo e($me['name'] ?? 'User'); ?></div>
+            <div class="pos-user-role"><?php echo e(ucfirst($me['role'] ?? '')); ?></div>
+          </div>
+          <div class="pos-user-chevron">▾</div>
+        </button>
+        <div class="pos-user-dropdown submenu" id="pos-user-menu">
+          <a href="<?php echo e($adminLandingUrl); ?>" class="pos-admin-link">Masuk ke Halaman Admin</a>
+          <a href="<?php echo e(base_url('pos/history.php')); ?>">Riwayat Transaksi</a>
+          <a href="<?php echo e(base_url('profile.php')); ?>">Edit Profil</a>
+          <a href="<?php echo e(base_url('password.php')); ?>">Ubah Password</a>
+        </div>
+      </div>
+      <a class="btn pos-logout" href="<?php echo e(base_url('pos/logout.php')); ?>">Logout</a>
+    </div>
+
+    <div class="pos-wrap">
+      <?php if ($notice): ?>
+        <div class="pos-panel pos-alert pos-alert-success"><?php echo e($notice); ?></div>
+      <?php endif; ?>
+      <?php if ($err): ?>
+        <div class="pos-panel pos-alert pos-alert-error"><?php echo e($err); ?></div>
+      <?php endif; ?>
+      <div class="pos-panel pos-shift-panel" data-shift-panel>
+        <div class="pos-shift-header">
+          <strong>Shift POS</strong>
+          <div class="pos-badges">
+            <span class="pos-online-badge" data-online-badge>ONLINE</span>
+            <span class="pos-sync-badge">Pending Sync: <strong data-sync-count>0</strong></span>
+          </div>
+        </div>
+        <?php if ($activeShift): ?>
+          <div class="pos-shift-grid">
+            <div><small>Kode</small><div><?php echo e($activeShift['shift_code']); ?></div></div>
+            <div><small>Dibuka</small><div><?php echo e($activeShift['opened_at']); ?></div></div>
+            <div><small>Kas Awal</small><div>Rp <?php echo e(format_number_id((float)$activeShift['opening_cash_actual'])); ?></div></div>
+            <div><small>Oleh</small><div><?php echo e($activeShift['opened_by_name'] ?? '-'); ?></div></div>
+          </div>
+          <div class="pos-shift-actions">
+            <button type="button" class="btn" data-open-cash-modal>Kas Masuk/Keluar</button>
+            <button type="button" class="btn" data-open-close-modal>Tutup Shift</button>
+            <button type="button" class="btn" data-manual-sync>Sinkronkan Sekarang</button>
+          </div>
+        <?php else: ?>
+          <div class="pos-empty-cart">Belum ada shift aktif.</div>
+          <?php if ($isShiftAdmin): ?>
+            <button type="button" class="btn" data-open-shift-modal>Buka Shift</button>
+          <?php else: ?>
+            <small>Menunggu staff yang berwenang membuka shift.</small>
+          <?php endif; ?>
+        <?php endif; ?>
+      </div>
+
+      <div class="pos-modal" data-shift-modal hidden><div class="pos-modal-card"><h3>Buka Shift</h3><p>Default kas awal: Rp <?php echo e(format_number_id($posDefaultOpeningCash)); ?></p><form data-open-shift-form><input type="number" step="0.01" name="opening_cash_actual" value="<?php echo e((string)$posDefaultOpeningCash); ?>" required><div class="pos-modal-actions"><button class="btn" type="submit">Simpan</button><button class="btn" type="button" data-dismiss-modal>Batal</button></div></form></div></div>
+      <div class="pos-modal" data-cash-modal hidden><div class="pos-modal-card"><h3>Kas Masuk / Keluar</h3><form data-cash-form><select name="movement_type"><option value="in">Kas Masuk</option><option value="out">Kas Keluar</option></select><input type="number" step="0.01" name="amount" placeholder="Nominal" required><input type="text" name="reason" placeholder="Alasan" required><textarea name="notes" placeholder="Catatan"></textarea><div class="pos-modal-actions"><button class="btn" type="submit">Simpan</button><button class="btn" type="button" data-dismiss-modal>Batal</button></div></form></div></div>
+      <div class="pos-modal" data-close-modal hidden><div class="pos-modal-card"><h3>Closing Shift</h3><?php if ($shiftSummary): ?><div class="pos-close-summary"><div>Kas Awal: Rp <?php echo e(format_number_id((float)$shiftSummary['opening_cash'])); ?></div><div>Penjualan Tunai: Rp <?php echo e(format_number_id((float)$shiftSummary['cash_sales'])); ?></div><div>Pengembalian Tunai: Rp <?php echo e(format_number_id((float)$shiftSummary['cash_refund'])); ?></div><div>Kas Masuk: Rp <?php echo e(format_number_id((float)$shiftSummary['cash_in'])); ?></div><div>Kas Keluar: Rp <?php echo e(format_number_id((float)$shiftSummary['cash_out'])); ?></div><div>Non Tunai: Rp <?php echo e(format_number_id((float)$shiftSummary['non_cash_sales'])); ?></div><div><strong>Kas Seharusnya: Rp <?php echo e(format_number_id((float)$shiftSummary['expected_cash'])); ?></strong></div></div><?php endif; ?><form data-close-shift-form><input type="number" step="0.01" name="counted_cash_total" placeholder="Uang fisik dihitung" required><textarea name="notes" placeholder="Catatan closing"></textarea><div class="pos-modal-actions"><button class="btn" type="submit">Tutup Shift</button><button class="btn" type="button" data-dismiss-modal>Batal</button></div></form></div></div>
+      <div class="pos-panel pos-orders">
+        <div class="pos-orders-header">
+          <h3>Pesanan Online</h3>
+          <span class="pos-orders-count"><?php echo e((string)count($pendingOrders)); ?> pending</span>
+        </div>
+        <?php if (empty($pendingOrders)): ?>
+          <div class="pos-empty">Belum ada pesanan dari landing page.</div>
+        <?php else: ?>
+          <div class="pos-orders-list">
+            <?php foreach ($pendingOrders as $order): ?>
+              <div class="pos-order-card">
+                <div class="pos-order-main">
+                  <div class="pos-order-code"><?php echo e($order['order_code']); ?></div>
+                  <div class="pos-order-customer"><?php echo e($order['name']); ?> · <?php echo e($order['contact']); ?></div>
+                  <div class="pos-order-time"><?php echo e($order['created_at']); ?></div>
+                </div>
+                <div class="pos-order-items">
+                  <?php foreach (($pendingOrderItems[(int)$order['id']] ?? []) as $item): ?>
+                    <div><?php echo e($item['qty']); ?>x <?php echo e($item['name']); ?></div>
+                  <?php endforeach; ?>
+                </div>
+                <form method="post">
+                  <input type="hidden" name="_csrf" value="<?php echo e(csrf_token()); ?>">
+                  <input type="hidden" name="action" value="load_order">
+                  <input type="hidden" name="order_id" value="<?php echo e((string)$order['id']); ?>">
+                  <button class="btn pos-btn pos-load-btn" type="submit">Ambil ke Keranjang</button>
+                </form>
+              </div>
+            <?php endforeach; ?>
+          </div>
+        <?php endif; ?>
+      </div>
+      <?php if (!empty($receipt)): ?>
+        <div class="pos-panel pos-receipt pos-print-area">
+          <div class="pos-receipt-header">
+            <div>
+              <div class="pos-receipt-title"><?php echo e($storeName); ?></div>
+              <?php if (!empty($storeSubtitle)): ?>
+                <div class="pos-receipt-subtitle"><?php echo e($storeSubtitle); ?></div>
+              <?php endif; ?>
+            </div>
+            <div class="pos-receipt-meta">
+              <div><?php echo e($receipt['id']); ?></div>
+              <div><?php echo e($receipt['time']); ?></div>
+              <div>Kasir: <?php echo e($receipt['cashier']); ?></div>
+            </div>
+          </div>
+
+          <div class="pos-receipt-items">
+            <?php foreach ($receipt['items'] as $item): ?>
+              <div class="pos-receipt-row">
+                <div>
+                  <div class="pos-receipt-item-name"><?php echo e($item['name']); ?></div>
+                  <div class="pos-receipt-item-meta">
+                    <?php echo e((string)$item['qty']); ?> x
+                    <?php if (!empty($item['is_reward'])): ?>
+                      Gratis
+                    <?php else: ?>
+                      Rp <?php echo e(format_number_id((float)$item['price'])); ?>
+                    <?php endif; ?>
+                  </div>
+                </div>
+                <div class="pos-receipt-item-subtotal">
+                  <?php if (!empty($item['is_reward'])): ?>
+                    Gratis
+                  <?php else: ?>
+                    Rp <?php echo e(format_number_id((float)$item['subtotal'])); ?>
+                  <?php endif; ?>
+                </div>
+              </div>
+            <?php endforeach; ?>
+          </div>
+
+          <div class="pos-receipt-total">
+            <span>Total</span>
+            <strong>Rp <?php echo e(format_number_id((float)$receipt['total'])); ?></strong>
+          </div>
+          <div class="pos-receipt-meta">
+            <div>Pembayaran: <?php echo e(strtoupper($receipt['payment'] ?? '-')); ?></div>
+            <?php if (array_key_exists('cash_received', $receipt) && $receipt['cash_received'] !== null): ?>
+              <div>Diterima: Rp <?php echo e(format_number_id((float)$receipt['cash_received'])); ?></div>
+              <div>Kembalian: Rp <?php echo e(format_number_id((float)($receipt['cash_change'] ?? 0))); ?></div>
+            <?php endif; ?>
+          </div>
+          <div class="pos-receipt-actions no-print">
+            <a class="btn pos-print-btn" href="<?php echo e(base_url('pos/receipt.php?id=' . urlencode($receipt['id']))); ?>">Print Struk 58mm</a>
+            <button class="btn pos-print-btn" type="button" data-print-receipt>Cetak Struk</button>
+            <form method="post" class="pos-new-transaction-form">
+              <input type="hidden" name="_csrf" value="<?php echo e(csrf_token()); ?>">
+              <input type="hidden" name="action" value="new_transaction">
+              <button class="btn pos-reset-btn" type="submit">Transaksi Baru</button>
+            </form>
+          </div>
+        </div>
+      <?php endif; ?>
+
+      <?php if (empty($receipt)): ?>
+        <div class="pos-layout">
+          <section class="pos-panel pos-products">
+            <div class="pos-products-header">
+              <div>
+                <h3>Produk</h3>
+                <small>Pilih produk untuk ditambahkan ke keranjang.</small>
+              </div>
+              <div class="pos-search">
+                <input id="pos-search" type="search" placeholder="Cari produk..." autocomplete="off">
+              </div>
+            </div>
+            <div class="pos-products-grid">
+              <?php foreach ($products as $p): ?>
+                <div class="pos-product-card" data-name="<?php echo e(strtolower($p['name'])); ?>" data-product-id="<?php echo e((string)$p['id']); ?>" data-product-title="<?php echo e($p['name']); ?>" data-product-price="<?php echo e((string)(float)$p['price']); ?>">
+                  <div class="pos-product-thumb">
+                    <?php if (!empty($p['image_path'])): ?>
+                      <img src="<?php echo e(upload_url($p['image_path'], 'image')); ?>" alt="<?php echo e($p['name']); ?>">
+                    <?php else: ?>
+                      <div class="pos-product-placeholder">No Image</div>
+                    <?php endif; ?>
+                  </div>
+                  <div class="pos-product-info">
+                    <div class="pos-product-name"><?php echo e($p['name']); ?></div>
+                    <div class="pos-product-price">Rp <?php echo e(format_number_id((float)$p['price'])); ?></div>
+                  </div>
+                  <form method="post" class="pos-product-action">
+                    <input type="hidden" name="_csrf" value="<?php echo e(csrf_token()); ?>">
+                    <input type="hidden" name="action" value="add">
+                    <input type="hidden" name="product_id" value="<?php echo e((string)$p['id']); ?>">
+                    <button class="btn pos-btn pos-add-btn" type="submit">Tambah</button>
+                  </form>
+                </div>
+              <?php endforeach; ?>
+              <?php if ($hasProducts): ?>
+                <div class="pos-empty" id="pos-empty">Produk tidak ditemukan.</div>
+              <?php else: ?>
+                <div class="pos-empty" style="display:block">Belum ada produk.</div>
+              <?php endif; ?>
+            </div>
+          </section>
+
+          <aside class="pos-panel pos-cart">
+            <div class="pos-cart-header">
+              <div>
+                <h3>Keranjang</h3>
+                <small>Ringkasan transaksi.</small>
+              </div>
+              <div class="pos-cart-count" data-local-cart-count><?php echo e((string)$cartCount); ?> item</div>
+            </div>
+            <div class="pos-cart-scroll">
+            <?php if (!empty($activeOrder)): ?>
+              <div class="pos-order-banner">
+                Pesanan: <strong><?php echo e($activeOrder['order_code']); ?></strong><br>
+                <?php echo e($activeOrder['name']); ?> · <?php echo e($activeOrder['contact']); ?><br>
+                <span class="pos-order-points">Sisa poin: <?php echo e((string)((int)($activeOrder['loyalty_points'] ?? 0))); ?> poin</span>
+              </div>
+              <?php if (!empty($availableRewards)): ?>
+                <div class="pos-order-banner pos-reward-banner">
+                  <strong>Reward tersedia untuk diklaim</strong>
+                  <div class="pos-reward-list">
+                    <?php foreach ($availableRewards as $reward): ?>
+                      <form method="post" class="pos-reward-claim">
+                        <input type="hidden" name="_csrf" value="<?php echo e(csrf_token()); ?>">
+                        <input type="hidden" name="action" value="claim_reward">
+                        <input type="hidden" name="reward_id" value="<?php echo e((string)$reward['id']); ?>">
+                        <button class="pos-reward-button" type="submit">
+                          <span><?php echo e($reward['name']); ?></span>
+                          <span class="pos-reward-points"><?php echo e((string)$reward['points_required']); ?> poin</span>
+                        </button>
+                      </form>
+                    <?php endforeach; ?>
+                  </div>
+                  <small>Klik reward untuk menambahkan produk gratis ke keranjang.</small>
+                </div>
+              <?php endif; ?>
+            <?php endif; ?>
+
+            <div class="pos-empty-cart" data-local-cart-empty <?php echo empty($cartItems) ? '' : 'hidden'; ?>>
+              <p><strong>Keranjang masih kosong.</strong></p>
+              <small>Tambahkan produk dari daftar di kiri.</small>
+            </div>
+            <div class="pos-cart-items" data-local-cart-items <?php echo empty($cartItems) ? 'hidden' : ''; ?>>
+                <?php foreach ($cartItems as $item): ?>
+                  <div class="pos-cart-item<?php echo !empty($item['is_reward']) ? ' pos-cart-item-reward' : ''; ?>">
+                    <div class="pos-cart-item-head">
+                      <div class="pos-cart-item-name">
+                        <?php echo e($item['name']); ?>
+                        <?php if (!empty($item['is_reward'])): ?>
+                          <span class="pos-reward-badge">Reward</span>
+                        <?php elseif (!empty($item['is_bypass'])): ?>
+                          <span class="pos-bypass-badge">Bypass BOM/Stok</span>
+                        <?php endif; ?>
+                      </div>
+                      <div class="pos-cart-item-price">
+                        <?php if (!empty($item['is_reward'])): ?>
+                          Gratis
+                        <?php else: ?>
+                          Rp <?php echo e(format_number_id($item['price'])); ?>
+                        <?php endif; ?>
+                      </div>
+                    </div>
+                    <div class="pos-cart-row">
+                      <?php if (!empty($item['is_reward'])): ?>
+                        <div class="pos-qty pos-qty-static">
+                          <div class="pos-qty-label">Qty</div>
+                          <div class="pos-qty-value"><?php echo e((string)$item['qty']); ?></div>
+                        </div>
+                        <div class="pos-cart-subtotal">Rp 0</div>
+                      <?php else: ?>
+                        <div class="pos-qty">
+                          <form method="post">
+                            <input type="hidden" name="_csrf" value="<?php echo e(csrf_token()); ?>">
+                            <input type="hidden" name="action" value="dec">
+                            <input type="hidden" name="product_id" value="<?php echo e((string)$item['id']); ?>">
+                            <button class="btn pos-qty-btn" type="submit">−</button>
+                          </form>
+                          <form method="post" class="pos-qty-input-form">
+                            <input type="hidden" name="_csrf" value="<?php echo e(csrf_token()); ?>">
+                            <input type="hidden" name="action" value="update_qty">
+                            <input type="hidden" name="product_id" value="<?php echo e((string)$item['id']); ?>">
+                            <input class="pos-qty-input" type="number" name="qty" value="<?php echo e((string)$item['qty']); ?>" min="1" max="9999" step="1" inputmode="numeric" aria-label="Jumlah <?php echo e($item['name']); ?>" onchange="this.form.submit()">
+                          </form>
+                          <form method="post">
+                            <input type="hidden" name="_csrf" value="<?php echo e(csrf_token()); ?>">
+                            <input type="hidden" name="action" value="inc">
+                            <input type="hidden" name="product_id" value="<?php echo e((string)$item['id']); ?>">
+                            <button class="btn pos-qty-btn" type="submit">+</button>
+                          </form>
+                        </div>
+                        <div class="pos-cart-subtotal">
+                          Rp <?php echo e(format_number_id($item['subtotal'])); ?>
+                          <?php if (!empty($item['discount_value'])): ?>
+                            <div class="pos-item-disc-badge">
+                              Diskon: <?php echo $item['discount_type'] === 'percent'
+                                ? e(format_number_id($item['discount_amount'])) . '%'
+                                : 'Rp ' . e(format_number_id($item['discount_amount'])); ?>
+                            </div>
+                          <?php endif; ?>
+                        </div>
+                      <?php endif; ?>
+                    </div>
+                    <?php if (empty($item['is_reward'])): ?>
+                      <form method="post" class="pos-item-discount-form">
+                        <input type="hidden" name="_csrf" value="<?php echo e(csrf_token()); ?>">
+                        <input type="hidden" name="action" value="set_item_discount">
+                        <input type="hidden" name="product_id" value="<?php echo e((string)$item['id']); ?>">
+                        <div class="pos-item-discount-row">
+                          <select name="discount_type" class="pos-disc-type">
+                            <option value="fixed"<?php echo ($item['discount_type'] ?? 'fixed') === 'fixed' ? ' selected' : ''; ?>>Rp</option>
+                            <option value="percent"<?php echo ($item['discount_type'] ?? '') === 'percent' ? ' selected' : ''; ?>>%</option>
+                          </select>
+                          <input type="number" name="discount_amount" value="<?php echo e((string)($item['discount_amount'] ?? 0)); ?>" min="0" step="any" placeholder="Diskon item..." class="pos-disc-input" onchange="this.form.submit()">
+                        </div>
+                      </form>
+                    <?php endif; ?>
+                    <?php if (empty($item['is_reward']) && $isOwner): ?>
+                      <form method="post" class="pos-bypass-form">
+                        <input type="hidden" name="_csrf" value="<?php echo e(csrf_token()); ?>">
+                        <input type="hidden" name="action" value="toggle_bypass">
+                        <input type="hidden" name="product_id" value="<?php echo e((string)$item['id']); ?>">
+                        <label class="pos-bypass-toggle"><input type="checkbox" <?php echo !empty($item['is_bypass']) ? 'checked' : ''; ?> onchange="this.form.submit()"> Lewati BOM &amp; stok</label>
+                      </form>
+                    <?php endif; ?>
+                    <?php if (!empty($item['is_reward'])): ?>
+                      <form method="post" class="pos-remove-form">
+                        <input type="hidden" name="_csrf" value="<?php echo e(csrf_token()); ?>">
+                        <input type="hidden" name="action" value="remove_reward">
+                        <input type="hidden" name="reward_id" value="<?php echo e((string)$item['reward_id']); ?>">
+                        <button class="btn pos-remove-btn" type="submit">Hapus Reward</button>
+                      </form>
+                    <?php else: ?>
+                      <form method="post" class="pos-remove-form">
+                        <input type="hidden" name="_csrf" value="<?php echo e(csrf_token()); ?>">
+                        <input type="hidden" name="action" value="remove">
+                        <input type="hidden" name="product_id" value="<?php echo e((string)$item['id']); ?>">
+                        <button class="btn pos-remove-btn" type="submit">Hapus</button>
+                      </form>
+                    <?php endif; ?>
+                  </div>
+                <?php endforeach; ?>
+              </div>
+
+              <div class="pos-summary" data-local-cart-summary <?php echo empty($cartItems) ? 'hidden' : ''; ?>>
+                <div class="pos-summary-row">
+                  <span>Total</span>
+                  <strong data-local-cart-total>Rp <?php echo e(format_number_id($total)); ?></strong>
+                </div>
+                <form method="post" class="pos-new-transaction-form">
+                  <input type="hidden" name="_csrf" value="<?php echo e(csrf_token()); ?>">
+                  <input type="hidden" name="action" value="new_transaction">
+                  <button class="btn pos-reset-btn" type="submit">Transaksi Baru</button>
+                </form>
+                <form method="post" enctype="multipart/form-data" data-checkout-form>
+                  <input type="hidden" name="_csrf" value="<?php echo e(csrf_token()); ?>">
+                  <input type="hidden" name="action" value="checkout">
+                  <input type="hidden" name="offline_uuid" value="">
+                  <input type="hidden" name="transaction_group_uuid" value="">
+                  <div class="pos-customer-card">
+                    <label for="pos-customer-phone">Pelanggan / Membership</label>
+                    <input id="pos-customer-phone" type="tel" name="customer_phone" autocomplete="tel" placeholder="Nomor HP pelanggan">
+                    <div id="pos-customer-status" class="pos-customer-status">Masukkan nomor HP untuk mengecek membership.</div>
+                    <input id="pos-customer-name" type="text" name="customer_name" autocomplete="name" placeholder="Nama pelanggan">
+                    <select id="pos-customer-gender" name="customer_gender">
+                      <option value="">Jenis kelamin</option>
+                      <option value="male">Laki-laki</option>
+                      <option value="female">Perempuan</option>
+                    </select>
+                  </div>
+                  <div class="pos-guide">
+                    <label for="pos-guide-name">Nama Guide <small style="font-weight:400;opacity:.7">(opsional)</small></label>
+                    <input id="pos-guide-name" type="text" name="guide_name" list="pos-guide-list" autocomplete="off" placeholder="Ketik atau pilih nama guide..." maxlength="100">
+                    <datalist id="pos-guide-list">
+                      <?php foreach ($activeGuides as $g): ?>
+                        <option value="<?php echo e($g['name']); ?>">
+                      <?php endforeach; ?>
+                    </datalist>
+                  </div>
+                  <div class="pos-payment">
+                    <label>Metode Pembayaran</label>
+                    <div class="pos-payment-options">
+                      <?php foreach ($activePaymentMethods as $i => $pm): ?>
+                        <label class="pos-payment-option">
+                          <input type="radio" name="payment_method" value="<?php echo e($pm['code']); ?>"
+                            <?php echo $i === 0 ? ' checked' : ''; ?>>
+                          <span><?php echo e($pm['name']); ?></span>
+                        </label>
+                      <?php endforeach; ?>
+                    </div>
+                    <div id="pos-bank-wrap" style="display:none;margin-top:10px">
+                      <?php if (!empty($qrisBanks)): ?>
+                        <label for="pos-payment-bank" style="font-size:.85rem;margin-bottom:4px;display:block">Pilih Bank</label>
+                        <select id="pos-payment-bank" name="payment_bank" class="pos-bank-select">
+                          <option value="">-- pilih bank --</option>
+                          <?php foreach ($qrisBanks as $bi => $bank): ?>
+                            <option value="<?php echo e($bank['name']); ?>"><?php echo e($bank['name']); ?></option>
+                          <?php endforeach; ?>
+                        </select>
+                      <?php else: ?>
+                        <div class="pos-bank-empty">Bank non-tunai belum diatur/diaktifkan di admin.</div>
+                      <?php endif; ?>
+                    </div>
+                  </div>
+                  <div id="pos-cash-wrap" class="pos-cash-wrap" style="display:none;margin-top:10px">
+                    <label for="pos-cash-received" style="font-size:.85rem;margin-bottom:4px;display:block">Uang diterima</label>
+                    <input id="pos-cash-received" type="number" min="0" step="100" name="cash_received" placeholder="Masukkan uang diterima">
+                    <div id="pos-cash-change" class="pos-cash-change">Kembalian: Rp 0</div>
+                  </div>
+                  <div class="pos-tx-discount">
+                    <label>Diskon Total <small style="font-weight:400;opacity:.7">(opsional)</small></label>
+                    <div class="pos-item-discount-row">
+                      <select name="tx_discount_type" class="pos-disc-type">
+                        <option value="fixed">Rp</option>
+                        <option value="percent">%</option>
+                      </select>
+                      <input type="number" name="tx_discount_amount" value="0" min="0" step="any" placeholder="0" class="pos-disc-input" id="pos-tx-discount-input">
+                    </div>
+                  </div>
+                  <button class="btn pos-checkout" type="submit">Checkout</button>
+                </form>
+              </div>
+            </div>
+          </aside>
+        </div>
+      <?php endif; ?>
+    </div>
+  </div>
+  <script defer src="<?php echo e(asset_url('assets/app.js')); ?>"></script>
+  <script nonce="<?php echo e(csp_nonce()); ?>">
+    (function () {
+      var bankMethods = ['qris', 'edc', 'transfer', 'credit_card'];
+      var cartTotal = <?php echo json_encode((float)$total); ?>;
+      function rupiah(n) { return 'Rp ' + Math.max(0, Number(n || 0)).toLocaleString('id-ID'); }
+      function isCash(code) { code = String(code || '').toLowerCase(); return code === 'cash' || code === 'tunai' || code.indexOf('cash') !== -1 || code.indexOf('tunai') !== -1; }
+      function updateCashBox() {
+        var checked = document.querySelector('input[name="payment_method"]:checked');
+        var code = checked ? String(checked.value || '').toLowerCase() : '';
+        var wrap = document.getElementById('pos-cash-wrap');
+        var input = document.getElementById('pos-cash-received');
+        var change = document.getElementById('pos-cash-change');
+        if (!wrap || !input || !change) return;
+        var cash = isCash(code);
+        wrap.style.display = cash ? '' : 'none';
+        input.required = cash;
+        if (!cash) { input.value = ''; change.textContent = 'Kembalian: Rp 0'; change.classList.remove('negative'); return; }
+        var diff = Number(input.value || 0) - cartTotal;
+        change.textContent = diff >= 0 ? ('Kembalian: ' + rupiah(diff)) : ('Kurang: ' + rupiah(Math.abs(diff)));
+        change.classList.toggle('negative', diff < 0);
+      }
+      function updateBankDropdown() {
+        var wrap = document.getElementById('pos-bank-wrap');
+        if (!wrap) return;
+        var checked = document.querySelector('input[name="payment_method"]:checked');
+        var code = checked ? String(checked.value || '').toLowerCase() : '';
+        var needsBank = bankMethods.indexOf(code) !== -1;
+        wrap.style.display = needsBank ? '' : 'none';
+        var select = document.getElementById('pos-payment-bank');
+        if (select) {
+          select.required = needsBank;
+          if (!needsBank) select.value = '';
+        }
+      }
+      document.addEventListener('DOMContentLoaded', function(){ updateBankDropdown(); updateCashBox(); var cashInput = document.getElementById('pos-cash-received'); if (cashInput) cashInput.addEventListener('input', updateCashBox); });
+      document.addEventListener('change', function (e) {
+        if (e.target && e.target.name === 'payment_method') { updateBankDropdown(); updateCashBox(); }
+      });
+    })();
+
+    window.POS_RUNTIME = {
+      csrf: <?php echo json_encode(csrf_token()); ?>,
+      shiftApiUrl: <?php echo json_encode(base_url('pos/shift_api.php')); ?>,
+      syncUrl: <?php echo json_encode(base_url('pos/sync.php')); ?>,
+      cartStateUrl: <?php echo json_encode(base_url('pos/cart_state.php')); ?>,
+      cartStorageKey: <?php echo json_encode('adena_pos_cart_v2_u' . (int)($me['id'] ?? 0) . '_b' . $branchId); ?>,
+      customerLookupUrl: <?php echo json_encode(base_url('pos/customer_lookup.php')); ?>,
+      serviceWorkerUrl: <?php echo json_encode(base_url('pos/service-worker.js')); ?>,
+      userName: <?php echo json_encode($me['name'] ?? 'Kasir'); ?>,
+      isShiftAdmin: <?php echo $isShiftAdmin ? 'true' : 'false'; ?>,
+      hasActiveShift: <?php echo $activeShift ? 'true' : 'false'; ?>,
+      shiftState: <?php echo json_encode($activeShift ? 'active_shift_exists' : 'no_active_shift'); ?>,
+      cartTotal: <?php echo json_encode((float)$total); ?>,
+      storeName: <?php echo json_encode($storeName); ?>,
+      storeSubtitle: <?php echo json_encode($storeSubtitle); ?>,
+      storeAddress: <?php echo json_encode(setting('store_address', '')); ?>,
+      storePhone: <?php echo json_encode(setting('store_phone', '')); ?>,
+      receiptFooter: <?php echo json_encode(setting('receipt_footer', '')); ?>,
+      storeLogoUrl: <?php echo json_encode(upload_url(setting('store_logo', ''), 'image')); ?>
+    };
+    window.POS_STATE = {
+      cartItems: <?php echo json_encode($cartItems); ?>,
+      productNames: <?php echo json_encode(array_map(fn($p) => $p['name'], $productsById)); ?>,
+      products: <?php echo json_encode(array_values(array_map(fn($p) => ['id'=>(int)$p['id'],'name'=>$p['name'],'price'=>(float)$p['price'],'image_path'=>$p['image_path'] ?? '','track_stock'=>(int)($p['track_stock'] ?? 1),'current_stock'=>(float)($p['current_stock'] ?? 0),'category_id'=>$p['category_id'] ?? null], $products))); ?>,
+      activeShiftId: <?php echo json_encode($activeShift ? (int)$activeShift['id'] : null); ?>
+    };
+  </script>
+  <script defer src="<?php echo e(asset_url('pos/offline-sync.js')); ?>"></script>
+  <script defer src="<?php echo e(asset_url('pos/local-cart.js')); ?>"></script>
+  <script defer src="<?php echo e(asset_url('pos/pos.js')); ?>"></script>
+  <script nonce="<?php echo e(csp_nonce()); ?>">if ('serviceWorker' in navigator) { window.addEventListener('load', function(){ navigator.serviceWorker.register(window.POS_RUNTIME.serviceWorkerUrl).catch(function(){}); }); }</script>
+</body>
+</html>
